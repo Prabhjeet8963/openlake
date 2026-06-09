@@ -25,6 +25,7 @@ use crate::s3::state::AppState;
 
 pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
     let admin_cfg = cfg.clone();
+    let ping_cfg = cfg.clone();
     let bucket_routes = put(buckets::put_bucket)
         .delete(buckets::delete_bucket)
         .head(buckets::head_bucket)
@@ -33,17 +34,30 @@ pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
 
     Router::new()
         .route("/", get(list_buckets_unimplemented))
-        .route("/openlake/admin/v1/config", get(move || {
-            let cfg = admin_cfg.clone();
-            async move { serve_admin_config(cfg).await }
-        }))
-        .route("/{bucket}",        bucket_routes.clone())
-        .route("/{bucket}/",       bucket_routes)
-        .route("/{bucket}/{*key}", get(objects::get_object)
-                                   .head(objects::head_object)
-                                   .delete(objects::delete_object)
-                                   .put(objects::put_object)
-                                   .post(objects::post_object))
+        .route(
+            "/openlake/admin/v1/config",
+            get(move || {
+                let cfg = admin_cfg.clone();
+                async move { serve_admin_config(cfg).await }
+            }),
+        )
+        .route(
+            "/openlake/admin/v1/ping",
+            get(move || {
+                let cfg = ping_cfg.clone();
+                async move { serve_admin_ping(cfg).await }
+            }),
+        )
+        .route("/{bucket}", bucket_routes.clone())
+        .route("/{bucket}/", bucket_routes)
+        .route(
+            "/{bucket}/{*key}",
+            get(objects::get_object)
+                .head(objects::head_object)
+                .delete(objects::delete_object)
+                .put(objects::put_object)
+                .post(objects::post_object),
+        )
         .fallback(not_found)
         .layer(axum::middleware::from_fn_with_state(state.clone(), sigv4))
         .with_state(state)
@@ -56,9 +70,29 @@ async fn list_buckets_unimplemented() -> Result<axum::http::Response<axum::body:
 async fn serve_admin_config(cfg: Arc<Config>) -> axum::Json<Config> {
     let mut c = (*cfg).clone();
     c.self_id = 0;
-    if let Some(r) = c.rdma.as_mut() { r.self_node_id = 0; }
-    for cr in &mut c.credentials { cr.secret_key = "***".into(); }
+    if let Some(r) = c.rdma.as_mut() {
+        r.self_node_id = 0;
+    }
+    for cr in &mut c.credentials {
+        cr.secret_key = "***".into();
+    }
     axum::Json(c)
+}
+
+/// Liveness response for `GET /openlake/admin/v1/ping`. Served on the S3
+/// listener (behind SigV4) so cluster tooling can check a node without
+/// touching the inter-node RPC plane.
+#[derive(serde::Serialize)]
+struct Ping {
+    status: &'static str,
+    node_id: u16,
+}
+
+async fn serve_admin_ping(cfg: Arc<Config>) -> axum::Json<Ping> {
+    axum::Json(Ping {
+        status: "ok",
+        node_id: cfg.self_id,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,9 +112,9 @@ impl<'a> Connected<cyper_axum::IncomingStream<'a, TlsTcpListener>> for CompioSoc
 
 pub async fn serve(
     listener: TcpListener,
-    state:    AppState,
-    tls:      Option<Rc<TlsAcceptor>>,
-    cfg:      Arc<Config>,
+    state: AppState,
+    tls: Option<Rc<TlsAcceptor>>,
+    cfg: Arc<Config>,
 ) -> Result<(), Infallible> {
     let app = build_router(state, cfg);
 
